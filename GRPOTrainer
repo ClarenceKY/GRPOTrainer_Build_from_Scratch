@@ -1,0 +1,150 @@
+class GRPOTrainer():
+
+  def __init__(self, policy, tokenizer, reward_function):
+    """
+    Args:
+        policy: The current policy model (e.g., LlamaForCausalLM).
+        prompts: List of str (batch prompts).
+        tokenizer: Matching tokenizer.
+    """
+    self.policy = policy
+    self.tokenizer = tokenizer
+    self.reward_function = reward_function
+
+  def group_outputs(self, policy, prompts, num_groups=4, max_new_tokens=30, temperature=1.0, device='cuda'):
+    """
+    Generate num_groups completions per prompt using the policy (on-policy sampling).
+    
+    Args:
+        num_groups: Group size (G)
+        max_new_tokens: Generation length.
+        temperature: For diversity.
+        device: Model device.
+    
+    Returns:
+        List[List[torch.Tensor]]: [batch] list of [num_groups] lists of response tensors [seq_len].
+    """
+    policy.eval()
+    all_groups = []
+    all_groups_logps = []
+    with torch.no_grad():
+        for prompt_str in prompts:
+            prompt_ids = tokenizer(prompt_str, return_tensors='pt', truncation=True, max_length=512)['input_ids'].to(device)
+            group_responses = []
+            group_logps = []
+            for _ in range(num_groups):
+                # Generate with sampling for diversity
+                outputs = policy.generate(
+                    prompt_ids,
+                    max_new_tokens=max_new_tokens,
+                    do_sample=True,
+                    temperature=temperature,
+                    top_p=0.9,
+                    pad_token_id=tokenizer.eos_token_id,
+                    return_dict_in_generate=True,
+                    output_scores=True  # Optional: for logprobs later
+                )
+                # Extract response tokens (exclude prompt)
+                response_ids = outputs.sequences[0, len(prompt_ids[0]):]
+                group_responses.append(response_ids)  # Tensor [seq_len]
+
+                # per token logprobs for each output inside the group
+                # outputs.scores (length T:number of generated tokens), each [batch_size, vocab_size]
+                per_token_logprobs = []
+                for t, logits_t in enumerate(outputs.scores):
+                  logp_t = F.log_softmax(logits_t, dim=-1)
+                  token_id_t = response_ids[t].item()
+                  per_token_logprobs.append(logp_t[0,token_id_t])
+                group_logps.append(torch.stack(per_token_logprobs, dim=0))
+            all_groups.append(group_responses)  # [num_groups] list of tensors
+            all_groups_logps.append(group_logps)
+    
+    return all_groups, all_groups_logps
+
+  def compute_group_relative_advantage(self, responses, epsilon=0.2):
+    """Simplified group-relative advantage: subtract batch mean, clip."""
+    completions = []
+    for p in responses:
+      for g in p:
+        completions.append([{"content": tokenizer.decode(g, skip_special_tokens=True)}])
+    rewards = torch.tensor(self.reward_function(completions))
+    baseline = torch.mean(rewards)
+    advantages = rewards - baseline
+    advantages = torch.clamp(advantages, -epsilon * torch.std(rewards), epsilon * torch.std(rewards))
+    return advantages
+
+  def grpo_objective(self, ref_model, old_outputs, old_per_token_logps, advantages, epsilon=0.2, beta=0.01, group_size=4):
+    """Compute GRPO surrogate objective"""
+
+    _, per_token_logps = group_outputs(policy=self.policy, prompt_tensors=old_outputs)
+    per_token_logps = torch.stack(per_token_logps[0])
+    ref_per_token_logps = torch.stack(old_per_token_logps)
+    print(per_token_logps.shape)
+    # Per-token ratio [num_groups, generate_length]
+    ratio = torch.exp(per_token_logps - ref_per_token_logps)
+    surr1 = ratio * advantages
+    surr2 = torch.clamp(ratio, 1 - epsilon, 1 + epsilon) * advantages
+    surrogate = torch.min(surr1, surr2)
+
+    # Per-token KL divergence
+    per_token_kl = torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
+    
+    # Step 1: Inner mean over per token inside each group: group_size
+    token_surr_mean = (surrogate.sum(dim=1) / group_size)  # 1/|o_i| sum_t surrogate_{i,t}
+    token_kl_mean = (per_token_kl.sum(dim=1) / group_size)  # Similarly for KL
+    # Step 2: Outer mean over groups: scalar
+    group_surr_mean = token_surr_mean.mean()  # 1/G sum_i token_surr_mean_i
+    group_kl_mean = token_kl_mean.mean()
+
+    grpo_obj = group_surr_mean - beta * group_kl_mean
+    
+    return grpo_obj
+
+  def grpo_algorithm(policy, reward_model, prompts, I=10, M=5, mu=4, epsilon=0.2, beta=0.01, lr_policy=1e-4, lr_reward=1e-3):
+    """
+    There're three nested loops in the GRPO algorithm.
+    """
+    # Initialize models
+    policy_init = self.policy
+    optimizer_policy = optim.Adam(policy_init.parameters(), lr=lr_policy) # input the initial parameters to the optimizer
+    
+    policy_theta = policy_init  # π_θ ← π_init
+    batch_size = 16
+    
+    for iteration in range(1, I + 1):  # Outer loop: for iteration = 1, ..., I do
+        print(f"Outer Iteration {iteration}/{I}")
+        ref_model = self.policy  # Copy for reference; in practice, clone weights
+        ref_model.load_state_dict(policy_theta.state_dict())
+        ref_model.eval()
+        
+        for step in range(1, M + 1):  # Middle loop: for step = 1, ..., M do
+            # Sample batches from prompts
+            batch_prompts = random.sample(self.prompts, batch_size)
+            
+            # Update old policy π_θ_old ← π_θ
+            policy_theta_old = self.policy
+            policy_theta_old.load_state_dict(policy_theta.state_dict())
+            policy_theta_old.eval()
+            
+            # Sample G=1 outputs {o_i^G} for each q in D_b (G=1 for simplicity)
+            outputs = group_outputs(policy_theta_old, batch_prompts)
+            outputs = torch.stack(outputs)  # [batch, seq_len]
+            
+            # Compute Â_{i,t} (simplified per-output, not per-token)
+            advantages = compute_group_relative_advantage(outputs, epsilon)
+            
+            # Compute old logprobs
+            old_logprobs = policy_theta_old(outputs)[0].sum(-1)  # Sum over tokens
+            
+            for grpo_iter in range(1, mu + 1):  # Inner loop: for GRPO iteration = 1, ..., μ do
+                # Update π_θ by maximizing GRPO objective (Eq. 21)
+                policy_theta.train()
+                objective = grpo_objective(policy_theta, ref_model, outputs, advantages, old_logprobs, beta)
+                loss = -objective  # Maximize -> minimize negative
+                optimizer_policy.zero_grad()
+                loss.backward()
+                optimizer_policy.step()
+        
+        print(f"Completed outer iteration {iteration}")
+    
+    return policy_theta
